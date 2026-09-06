@@ -14,6 +14,19 @@ CF_ZONE_ID="${CF_ZONE_ID:-}"
 CF_CREATE_RECORD="${CF_CREATE_RECORD:-true}"
 CF_PROXIED="${CF_PROXIED:-false}"
 CF_TTL="${CF_TTL:-1}"
+RUN_MODE="${1:-start}"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
+if (( EUID == 0 )); then
+  DEFAULT_LOG_FILE="/var/log/cloudflare-ddns.log"
+  DEFAULT_PID_FILE="/run/cloudflare-ddns.pid"
+else
+  DEFAULT_LOG_FILE="$SCRIPT_DIR/cloudflare-ddns.log"
+  DEFAULT_PID_FILE="$SCRIPT_DIR/.cloudflare-ddns.pid"
+fi
+LOG_FILE="${DDNS_LOG_FILE:-$DEFAULT_LOG_FILE}"
+PID_FILE="${DDNS_PID_FILE:-$DEFAULT_PID_FILE}"
 
 IP_CHECK_URLS=(
   "https://ddns.oray.com/checkip"
@@ -27,10 +40,63 @@ log() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
+prepare_daily_log() {
+  LOG_DAY="$(date '+%Y-%m-%d')"
+  # 如果日志中没有当天记录，说明它来自前一天或更早，启动时直接清空。
+  if [[ -s "$LOG_FILE" ]] && ! grep -q "^${LOG_DAY} " "$LOG_FILE" 2>/dev/null; then
+    : >"$LOG_FILE"
+  fi
+}
+
+clear_log_after_midnight() {
+  local today
+  today="$(date '+%Y-%m-%d')"
+  if [[ "$today" != "$LOG_DAY" ]]; then
+    : >"$LOG_FILE"
+    LOG_DAY="$today"
+    log "已清理前一天日志；当前只保留当天日志"
+  fi
+}
+
 die() {
   log "错误：$*" >&2
   exit 1
 }
+
+running_pid() {
+  local pid=""
+  [[ -f "$PID_FILE" ]] || return 1
+  read -r pid <"$PID_FILE" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  printf '%s' "$pid"
+}
+
+case "$RUN_MODE" in
+  --status)
+    if pid="$(running_pid)"; then
+      log "DDNS 正在后台运行，PID：$pid，日志：$LOG_FILE"
+      exit 0
+    fi
+    log "DDNS 当前没有运行"
+    exit 1
+    ;;
+  --stop)
+    if pid="$(running_pid)"; then
+      kill -TERM "$pid" || die "无法停止 PID $pid"
+      log "已发送停止信号，PID：$pid"
+      exit 0
+    fi
+    rm -f -- "$PID_FILE"
+    log "DDNS 当前没有运行"
+    exit 0
+    ;;
+  start|--daemon-child)
+    ;;
+  *)
+    die "未知参数：$RUN_MODE；可用参数：--status、--stop"
+    ;;
+esac
 
 install_dependencies() {
   local missing=() command_name
@@ -74,15 +140,19 @@ install_dependencies() {
   log "依赖安装完成"
 }
 
-install_dependencies
-
 CF_API_TOKEN=""
 CF_DNS_RECORD=""
 
-read -r -s -p "请输入 Cloudflare API Token（输入内容不会显示）: " CF_API_TOKEN
-printf '\n'
-
-read -r -p "请输入需要更新的完整域名（例如 home.example.com）: " CF_DNS_RECORD
+if [[ "$RUN_MODE" == "--daemon-child" ]]; then
+  CF_API_TOKEN="${DDNS_CF_API_TOKEN:-}"
+  CF_DNS_RECORD="${DDNS_CF_DNS_RECORD:-}"
+  unset DDNS_CF_API_TOKEN DDNS_CF_DNS_RECORD
+else
+  install_dependencies
+  read -r -s -p "请输入 Cloudflare API Token（输入内容不会显示）: " CF_API_TOKEN
+  printf '\n'
+  read -r -p "请输入需要更新的完整域名（例如 home.example.com）: " CF_DNS_RECORD
+fi
 
 CF_DNS_RECORD="${CF_DNS_RECORD%.}"
 [[ -n "$CF_API_TOKEN" ]] || die "Token 不能为空"
@@ -93,6 +163,33 @@ CF_DNS_RECORD="${CF_DNS_RECORD%.}"
 (( CF_TTL == 1 || (CF_TTL >= 60 && CF_TTL <= 86400) )) || die "CF_TTL 必须为 1（自动）或 60 到 86400"
 [[ "$CF_CREATE_RECORD" == "true" || "$CF_CREATE_RECORD" == "false" ]] || die "CF_CREATE_RECORD 必须是 true 或 false"
 [[ "$CF_PROXIED" == "true" || "$CF_PROXIED" == "false" ]] || die "CF_PROXIED 必须是 true 或 false"
+
+if [[ "$RUN_MODE" != "--daemon-child" ]]; then
+  if pid="$(running_pid)"; then
+    die "DDNS 已经在运行，PID：$pid"
+  fi
+  rm -f -- "$PID_FILE"
+  umask 077
+  : >>"$LOG_FILE" || die "无法写入日志文件：$LOG_FILE"
+
+  DDNS_CF_API_TOKEN="$CF_API_TOKEN" \
+  DDNS_CF_DNS_RECORD="$CF_DNS_RECORD" \
+  DDNS_LOG_FILE="$LOG_FILE" \
+  DDNS_PID_FILE="$PID_FILE" \
+    nohup "$SCRIPT_PATH" --daemon-child >>"$LOG_FILE" 2>&1 </dev/null &
+  child_pid=$!
+  printf '%s\n' "$child_pid" >"$PID_FILE" || die "无法写入 PID 文件：$PID_FILE"
+  sleep 1
+  if ! kill -0 "$child_pid" 2>/dev/null; then
+    rm -f -- "$PID_FILE"
+    die "后台启动失败，请查看日志：$LOG_FILE"
+  fi
+  log "DDNS 已转入后台运行，PID：$child_pid"
+  log "日志文件：$LOG_FILE"
+  log "查看状态：sudo $SCRIPT_PATH --status"
+  log "停止服务：sudo $SCRIPT_PATH --stop"
+  exit 0
+fi
 
 valid_public_ipv4() {
   local ip="$1" a b c d
@@ -230,8 +327,10 @@ stopped=false
 trap 'stopped=true' INT TERM
 last_synced_ip=""
 
+prepare_daily_log
 log "DDNS 已启动：域名 $CF_DNS_RECORD，检查间隔 ${CHECK_INTERVAL} 秒"
 while [[ "$stopped" == "false" ]]; do
+  clear_log_after_midnight
   if current_ip="$(get_public_ipv4)"; then
     if [[ "$current_ip" != "$last_synced_ip" ]]; then
       log "检测到公网 IPv4：$current_ip"
@@ -252,3 +351,4 @@ while [[ "$stopped" == "false" ]]; do
 done
 
 log "DDNS 已停止"
+rm -f -- "$PID_FILE"
