@@ -14,6 +14,7 @@ CF_ZONE_ID="${CF_ZONE_ID:-}"
 CF_CREATE_RECORD="${CF_CREATE_RECORD:-true}"
 CF_PROXIED="${CF_PROXIED:-false}"
 CF_TTL="${CF_TTL:-1}"
+TELEGRAM_SERVER_NAME="AWS--新加坡--1"
 RUN_MODE="${1:-start}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,12 +22,15 @@ SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
 if (( EUID == 0 )); then
   DEFAULT_LOG_FILE="/var/log/cloudflare-ddns.log"
   DEFAULT_PID_FILE="/run/cloudflare-ddns.pid"
+  DEFAULT_COUNT_STATE_FILE="/var/lib/cloudflare-ddns/ip-update-count"
 else
   DEFAULT_LOG_FILE="$SCRIPT_DIR/cloudflare-ddns.log"
   DEFAULT_PID_FILE="$SCRIPT_DIR/.cloudflare-ddns.pid"
+  DEFAULT_COUNT_STATE_FILE="$SCRIPT_DIR/.cloudflare-ddns-ip-update-count"
 fi
 LOG_FILE="${DDNS_LOG_FILE:-$DEFAULT_LOG_FILE}"
 PID_FILE="${DDNS_PID_FILE:-$DEFAULT_PID_FILE}"
+COUNT_STATE_FILE="${DDNS_COUNT_STATE_FILE:-$DEFAULT_COUNT_STATE_FILE}"
 
 IP_CHECK_URLS=(
   "https://ddns.oray.com/checkip"
@@ -37,11 +41,12 @@ IP_CHECK_URLS=(
 )
 
 log() {
-  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+  # 即使系统设置失败，DDNS 日志仍按北京时间显示。
+  printf '%s %s\n' "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
 prepare_daily_log() {
-  LOG_DAY="$(date '+%Y-%m-%d')"
+  LOG_DAY="$(TZ=Asia/Shanghai date '+%Y-%m-%d')"
   # 如果日志中没有当天记录，说明它来自前一天或更早，启动时直接清空。
   if [[ -s "$LOG_FILE" ]] && ! grep -q "^${LOG_DAY} " "$LOG_FILE" 2>/dev/null; then
     : >"$LOG_FILE"
@@ -50,7 +55,7 @@ prepare_daily_log() {
 
 clear_log_after_midnight() {
   local today
-  today="$(date '+%Y-%m-%d')"
+  today="$(TZ=Asia/Shanghai date '+%Y-%m-%d')"
   if [[ "$today" != "$LOG_DAY" ]]; then
     : >"$LOG_FILE"
     LOG_DAY="$today"
@@ -98,6 +103,35 @@ case "$RUN_MODE" in
     ;;
 esac
 
+configure_beijing_time() {
+  local run_as_root=()
+  local timezone_set=false
+
+  if (( EUID != 0 )); then
+    command -v sudo >/dev/null 2>&1 || die "当前不是 root 用户且系统没有 sudo，无法设置北京时间"
+    run_as_root=(sudo)
+  fi
+
+  log "正在设置系统时区为北京时间（Asia/Shanghai）"
+  if command -v timedatectl >/dev/null 2>&1; then
+    if "${run_as_root[@]}" timedatectl set-timezone Asia/Shanghai; then
+      timezone_set=true
+      if ! "${run_as_root[@]}" timedatectl set-ntp true; then
+        log "已设置北京时间，但未能启用 NTP 自动校时；请检查服务器的时间同步服务" >&2
+      fi
+    fi
+  fi
+
+  # 适配 Docker、OpenVZ 等没有 systemd 的 Linux 环境。
+  if [[ "$timezone_set" != "true" ]]; then
+    [[ -e /usr/share/zoneinfo/Asia/Shanghai ]] || die "系统缺少 Asia/Shanghai 时区数据"
+    "${run_as_root[@]}" ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime || die "无法设置系统时区"
+    log "已设置北京时间；当前环境不支持 timedatectl，NTP 需由宿主机或系统服务维护" >&2
+  else
+    log "系统时区已设为北京时间，并已请求启用 NTP 自动校时"
+  fi
+}
+
 install_dependencies() {
   local missing=() command_name
   local run_as_root=()
@@ -142,21 +176,32 @@ install_dependencies() {
 
 CF_API_TOKEN=""
 CF_DNS_RECORD=""
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
 
 if [[ "$RUN_MODE" == "--daemon-child" ]]; then
   CF_API_TOKEN="${DDNS_CF_API_TOKEN:-}"
   CF_DNS_RECORD="${DDNS_CF_DNS_RECORD:-}"
-  unset DDNS_CF_API_TOKEN DDNS_CF_DNS_RECORD
+  TELEGRAM_BOT_TOKEN="${DDNS_TELEGRAM_BOT_TOKEN:-}"
+  TELEGRAM_CHAT_ID="${DDNS_TELEGRAM_CHAT_ID:-}"
+  unset DDNS_CF_API_TOKEN DDNS_CF_DNS_RECORD DDNS_TELEGRAM_BOT_TOKEN DDNS_TELEGRAM_CHAT_ID
 else
+  configure_beijing_time
   install_dependencies
   read -r -s -p "请输入 Cloudflare API Token（输入内容不会显示）: " CF_API_TOKEN
   printf '\n'
   read -r -p "请输入需要更新的完整域名（例如 home.example.com）: " CF_DNS_RECORD
+  read -r -s -p "请输入 Telegram Bot Token（留空则不发送提醒）: " TELEGRAM_BOT_TOKEN
+  printf '\n'
+  if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
+    read -r -p "请输入 Telegram Chat ID: " TELEGRAM_CHAT_ID
+  fi
 fi
 
 CF_DNS_RECORD="${CF_DNS_RECORD%.}"
 [[ -n "$CF_API_TOKEN" ]] || die "Token 不能为空"
 [[ "$CF_DNS_RECORD" == *.* ]] || die "请输入完整域名，例如 home.example.com"
+[[ -z "$TELEGRAM_BOT_TOKEN" || -n "$TELEGRAM_CHAT_ID" ]] || die "已填写 Telegram Bot Token 时必须填写 Chat ID"
 [[ "$CHECK_INTERVAL" =~ ^[0-9]+$ ]] && (( CHECK_INTERVAL >= 10 )) || die "CHECK_INTERVAL 必须是不小于 10 的整数"
 [[ "$HTTP_TIMEOUT" =~ ^[0-9]+$ ]] && (( HTTP_TIMEOUT >= 1 )) || die "HTTP_TIMEOUT 必须是正整数"
 [[ "$CF_TTL" =~ ^[0-9]+$ ]] || die "CF_TTL 必须是整数"
@@ -174,8 +219,11 @@ if [[ "$RUN_MODE" != "--daemon-child" ]]; then
 
   DDNS_CF_API_TOKEN="$CF_API_TOKEN" \
   DDNS_CF_DNS_RECORD="$CF_DNS_RECORD" \
+  DDNS_TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
+  DDNS_TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID" \
   DDNS_LOG_FILE="$LOG_FILE" \
   DDNS_PID_FILE="$PID_FILE" \
+  DDNS_COUNT_STATE_FILE="$COUNT_STATE_FILE" \
     nohup "$SCRIPT_PATH" --daemon-child >>"$LOG_FILE" 2>&1 </dev/null &
   child_pid=$!
   printf '%s\n' "$child_pid" >"$PID_FILE" || die "无法写入 PID 文件：$PID_FILE"
@@ -272,6 +320,64 @@ find_zone_id() {
   printf '%s' "$best_id"
 }
 
+verify_a_record() {
+  local zone_id="$1" record_id="$2" expected_ip="$3" response actual_ip
+  if ! response="$(cf_curl -X GET "$API_BASE/zones/$zone_id/dns_records/$record_id")"; then
+    log "无法核验 Cloudflare A 记录" >&2
+    return 1
+  fi
+  check_cf_response "$response" || return 1
+  actual_ip="$(jq -r '.result.content // empty' <<<"$response")"
+  if [[ "$actual_ip" != "$expected_ip" ]]; then
+    log "Cloudflare A 记录核验失败：期望 $expected_ip，实际 ${actual_ip:-空}" >&2
+    return 1
+  fi
+  return 0
+}
+
+increment_daily_update_count() {
+  local today saved_day="" saved_count=0 next_count state_dir temporary_file
+  today="$(TZ=Asia/Shanghai date '+%Y-%m-%d')"
+
+  if [[ -s "$COUNT_STATE_FILE" ]]; then
+    IFS=$'\t' read -r saved_day saved_count <"$COUNT_STATE_FILE" || true
+  fi
+  if [[ "$saved_day" != "$today" ]] || [[ ! "$saved_count" =~ ^[0-9]+$ ]]; then
+    saved_count=0
+  fi
+  next_count=$((saved_count + 1))
+
+  state_dir="$(dirname -- "$COUNT_STATE_FILE")"
+  mkdir -p "$state_dir" || { log "无法创建 Telegram 计数状态目录：$state_dir" >&2; return 1; }
+  umask 077
+  temporary_file="${COUNT_STATE_FILE}.$$"
+  printf '%s\t%s\n' "$today" "$next_count" >"$temporary_file" || { log "无法保存 Telegram 每日计数" >&2; return 1; }
+  mv -f -- "$temporary_file" "$COUNT_STATE_FILE" || { log "无法更新 Telegram 每日计数" >&2; return 1; }
+  printf '%s' "$next_count"
+}
+
+send_telegram_notification() {
+  local update_count="$1" message response error_message
+  [[ -n "$TELEGRAM_BOT_TOKEN" ]] || return 0
+
+  message="服务器：${TELEGRAM_SERVER_NAME}
+更换了IP：${update_count}次"
+  if ! response="$(curl -sS --max-time "$HTTP_TIMEOUT" -X POST \
+    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${message}")"; then
+    log "Telegram 消息发送失败：网络请求异常" >&2
+    return 1
+  fi
+  if ! jq -e '.ok == true' >/dev/null 2>&1 <<<"$response"; then
+    error_message="$(jq -r '.description // "未知错误"' <<<"$response" 2>/dev/null || true)"
+    log "Telegram 消息发送失败：${error_message:-未知错误}" >&2
+    return 1
+  fi
+  log "Telegram 提醒已发送：第 ${update_count} 次 IP 更换"
+  return 0
+}
+
 sync_dns() {
   local new_ip="$1" zone_id response count changed record_id old_ip body
 
@@ -302,7 +408,10 @@ sync_dns() {
       return 1
     fi
     check_cf_response "$response" || return 1
-    log "已创建 A 记录：$CF_DNS_RECORD -> $new_ip"
+    record_id="$(jq -r '.result.id // empty' <<<"$response")"
+    [[ -n "$record_id" ]] || { log "新建 A 记录后未返回记录 ID" >&2; return 1; }
+    verify_a_record "$zone_id" "$record_id" "$new_ip" || return 1
+    log "已创建并核验 A 记录：$CF_DNS_RECORD -> $new_ip"
     return 0
   fi
 
@@ -316,11 +425,20 @@ sync_dns() {
       return 1
     fi
     check_cf_response "$response" || return 1
-    log "已更新 A 记录：$CF_DNS_RECORD，$old_ip -> $new_ip"
+    verify_a_record "$zone_id" "$record_id" "$new_ip" || return 1
+    log "已更新并核验 A 记录：$CF_DNS_RECORD，$old_ip -> $new_ip"
     changed=1
   done < <(jq -r '.result[] | [.id, .content] | @tsv' <<<"$response")
 
-  (( changed == 1 )) || log "DNS 已是最新：$CF_DNS_RECORD -> $new_ip"
+  if (( changed == 1 )); then
+    if update_count="$(increment_daily_update_count)"; then
+      send_telegram_notification "$update_count" || true
+    else
+      log "DNS 已更新，但无法记录 Telegram 每日更换次数，因此未发送提醒" >&2
+    fi
+  else
+    log "DNS 已是最新：$CF_DNS_RECORD -> $new_ip"
+  fi
 }
 
 stopped=false
@@ -343,7 +461,7 @@ while [[ "$stopped" == "false" ]]; do
       log "公网 IPv4 未变化：$current_ip"
     fi
   else
-    log "所有公网 IPv4 查询接口均失败，${CHECK_INTERVAL} 秒后重试" >&2
+    log "本轮未能确认公网 IPv4，${CHECK_INTERVAL} 秒后重试" >&2
   fi
 
   sleep "$CHECK_INTERVAL" &
