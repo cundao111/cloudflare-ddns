@@ -8,7 +8,7 @@
 set -uo pipefail
 
 API_BASE="https://api.cloudflare.com/client/v4"
-CHECK_INTERVAL="${CHECK_INTERVAL:-300}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-180}"
 HTTP_TIMEOUT="${HTTP_TIMEOUT:-15}"
 CF_ZONE_ID="${CF_ZONE_ID:-}"
 CF_CREATE_RECORD="${CF_CREATE_RECORD:-true}"
