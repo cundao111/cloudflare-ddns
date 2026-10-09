@@ -452,13 +452,14 @@ while [[ "$stopped" == "false" ]]; do
   if current_ip="$(get_public_ipv4)"; then
     if [[ "$current_ip" != "$last_synced_ip" ]]; then
       log "检测到公网 IPv4：$current_ip"
-      if sync_dns "$current_ip"; then
-        last_synced_ip="$current_ip"
-      else
-        log "本轮同步失败，${CHECK_INTERVAL} 秒后重试" >&2
-      fi
     else
       log "公网 IPv4 未变化：$current_ip"
+    fi
+    # 即使服务器 IP 未变，也核验 Cloudflare 中该域名的 A 记录是否被手动修改或同步失败。
+    if sync_dns "$current_ip"; then
+      last_synced_ip="$current_ip"
+    else
+      log "本轮 DNS 核验或同步失败，${CHECK_INTERVAL} 秒后重试" >&2
     fi
   else
     log "本轮未能确认公网 IPv4，${CHECK_INTERVAL} 秒后重试" >&2
