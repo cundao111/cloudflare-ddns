@@ -14,7 +14,7 @@ CF_ZONE_ID="${CF_ZONE_ID:-}"
 CF_CREATE_RECORD="${CF_CREATE_RECORD:-true}"
 CF_PROXIED="${CF_PROXIED:-false}"
 CF_TTL="${CF_TTL:-1}"
-TELEGRAM_SERVER_NAME="AWS--新加坡--1"
+DEFAULT_TELEGRAM_SERVER_NAME="AWS--新加坡--1"
 RUN_MODE="${1:-start}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,6 +38,13 @@ IP_CHECK_URLS=(
   "https://4.ipw.cn"
   "https://v4.yinghualuo.cn/bejson"
   "https://myip.ipip.net"
+)
+
+IPV6_CHECK_URLS=(
+  "https://speed.neu6.edu.cn/getIP.php"
+  "https://v6.ident.me"
+  "https://6.ipw.cn"
+  "https://v6.yinghualuo.cn/bejson"
 )
 
 log() {
@@ -176,21 +183,28 @@ install_dependencies() {
 
 CF_API_TOKEN=""
 CF_DNS_RECORD=""
+CF_DNS_RECORD_V6=""
+TELEGRAM_SERVER_NAME=""
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 
 if [[ "$RUN_MODE" == "--daemon-child" ]]; then
   CF_API_TOKEN="${DDNS_CF_API_TOKEN:-}"
   CF_DNS_RECORD="${DDNS_CF_DNS_RECORD:-}"
+  CF_DNS_RECORD_V6="${DDNS_CF_DNS_RECORD_V6:-}"
+  TELEGRAM_SERVER_NAME="${DDNS_TELEGRAM_SERVER_NAME:-$DEFAULT_TELEGRAM_SERVER_NAME}"
   TELEGRAM_BOT_TOKEN="${DDNS_TELEGRAM_BOT_TOKEN:-}"
   TELEGRAM_CHAT_ID="${DDNS_TELEGRAM_CHAT_ID:-}"
-  unset DDNS_CF_API_TOKEN DDNS_CF_DNS_RECORD DDNS_TELEGRAM_BOT_TOKEN DDNS_TELEGRAM_CHAT_ID
+  unset DDNS_CF_API_TOKEN DDNS_CF_DNS_RECORD DDNS_CF_DNS_RECORD_V6 DDNS_TELEGRAM_SERVER_NAME DDNS_TELEGRAM_BOT_TOKEN DDNS_TELEGRAM_CHAT_ID
 else
   configure_beijing_time
   install_dependencies
   read -r -s -p "请输入 Cloudflare API Token（输入内容不会显示）: " CF_API_TOKEN
   printf '\n'
-  read -r -p "请输入需要更新的完整域名（例如 home.example.com）: " CF_DNS_RECORD
+  read -r -p "请输入需要更新的 IPv4 完整域名（例如 home.example.com）: " CF_DNS_RECORD
+  read -r -p "请输入需要更新的 IPv6 完整域名（留空则跳过 IPv6 DDNS）: " CF_DNS_RECORD_V6
+  read -r -p "请输入服务器名称（直接回车使用 ${DEFAULT_TELEGRAM_SERVER_NAME}）: " TELEGRAM_SERVER_NAME
+  TELEGRAM_SERVER_NAME="${TELEGRAM_SERVER_NAME:-$DEFAULT_TELEGRAM_SERVER_NAME}"
   read -r -s -p "请输入 Telegram Bot Token（留空则不发送提醒）: " TELEGRAM_BOT_TOKEN
   printf '\n'
   if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
@@ -199,8 +213,11 @@ else
 fi
 
 CF_DNS_RECORD="${CF_DNS_RECORD%.}"
+CF_DNS_RECORD_V6="${CF_DNS_RECORD_V6%.}"
 [[ -n "$CF_API_TOKEN" ]] || die "Token 不能为空"
-[[ "$CF_DNS_RECORD" == *.* ]] || die "请输入完整域名，例如 home.example.com"
+[[ "$CF_DNS_RECORD" == *.* ]] || die "请输入 IPv4 完整域名，例如 home.example.com"
+[[ -z "$CF_DNS_RECORD_V6" || "$CF_DNS_RECORD_V6" == *.* ]] || die "请输入 IPv6 完整域名，或直接回车跳过"
+[[ -n "$TELEGRAM_SERVER_NAME" ]] || die "服务器名称不能为空"
 [[ -z "$TELEGRAM_BOT_TOKEN" || -n "$TELEGRAM_CHAT_ID" ]] || die "已填写 Telegram Bot Token 时必须填写 Chat ID"
 [[ "$CHECK_INTERVAL" =~ ^[0-9]+$ ]] && (( CHECK_INTERVAL >= 10 )) || die "CHECK_INTERVAL 必须是不小于 10 的整数"
 [[ "$HTTP_TIMEOUT" =~ ^[0-9]+$ ]] && (( HTTP_TIMEOUT >= 1 )) || die "HTTP_TIMEOUT 必须是正整数"
@@ -219,6 +236,8 @@ if [[ "$RUN_MODE" != "--daemon-child" ]]; then
 
   DDNS_CF_API_TOKEN="$CF_API_TOKEN" \
   DDNS_CF_DNS_RECORD="$CF_DNS_RECORD" \
+  DDNS_CF_DNS_RECORD_V6="$CF_DNS_RECORD_V6" \
+  DDNS_TELEGRAM_SERVER_NAME="$TELEGRAM_SERVER_NAME" \
   DDNS_TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
   DDNS_TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID" \
   DDNS_LOG_FILE="$LOG_FILE" \
@@ -273,6 +292,37 @@ get_public_ipv4() {
   return 1
 }
 
+valid_public_ipv6() {
+  local ip="${1,,}"
+  [[ "$ip" == *:* ]] || return 1
+  [[ "$ip" =~ ^[0-9a-f:]+$ ]] || return 1
+  [[ "$ip" != "::" && "$ip" != "::1" ]] || return 1
+  # 排除 IPv6 链路本地、唯一本地（私网）和组播地址。
+  [[ ! "$ip" =~ ^fe[89ab][0-9a-f]: ]] || return 1
+  [[ ! "$ip" =~ ^f[cd][0-9a-f]{2}: ]] || return 1
+  [[ ! "$ip" =~ ^ff[0-9a-f]{2}: ]] || return 1
+  return 0
+}
+
+get_public_ipv6() {
+  local url response candidate
+  for url in "${IPV6_CHECK_URLS[@]}"; do
+    if ! response="$(curl -6 -fsSL --max-time "$HTTP_TIMEOUT" \
+      -A 'cloudflare-ddns/1.0' "$url" 2>/dev/null)"; then
+      log "IPv6 查询接口失败：$url" >&2
+      continue
+    fi
+
+    candidate="$(grep -Eo '([0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}' <<<"$response" | head -n 1 || true)"
+    if [[ -n "$candidate" ]] && valid_public_ipv6 "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    log "IPv6 查询接口未返回有效公网 IPv6：$url" >&2
+  done
+  return 1
+}
+
 cf_curl() {
   curl -fsS --max-time "$HTTP_TIMEOUT" \
     -H "Authorization: Bearer $CF_API_TOKEN" \
@@ -291,7 +341,7 @@ check_cf_response() {
 }
 
 find_zone_id() {
-  local response zone_name zone_id best_id="" best_length=0
+  local record_name="$1" response zone_name zone_id best_id="" best_length=0
 
   if [[ -n "$CF_ZONE_ID" ]]; then
     printf '%s' "$CF_ZONE_ID"
@@ -305,7 +355,7 @@ find_zone_id() {
   check_cf_response "$response" || return 1
 
   while IFS=$'\t' read -r zone_name zone_id; do
-    if [[ "$CF_DNS_RECORD" == "$zone_name" || "$CF_DNS_RECORD" == *."$zone_name" ]]; then
+    if [[ "$record_name" == "$zone_name" || "$record_name" == *."$zone_name" ]]; then
       if (( ${#zone_name} > best_length )); then
         best_id="$zone_id"
         best_length=${#zone_name}
@@ -314,22 +364,22 @@ find_zone_id() {
   done < <(jq -r '.result[] | [.name, .id] | @tsv' <<<"$response")
 
   if [[ -z "$best_id" ]]; then
-    log "找不到 $CF_DNS_RECORD 所属 Zone；请增加 Zone Read 权限或设置 CF_ZONE_ID" >&2
+    log "找不到 $record_name 所属 Zone；请增加 Zone Read 权限或设置 CF_ZONE_ID" >&2
     return 1
   fi
   printf '%s' "$best_id"
 }
 
-verify_a_record() {
+verify_dns_record() {
   local zone_id="$1" record_id="$2" expected_ip="$3" response actual_ip
   if ! response="$(cf_curl -X GET "$API_BASE/zones/$zone_id/dns_records/$record_id")"; then
-    log "无法核验 Cloudflare A 记录" >&2
+    log "无法核验 Cloudflare DNS 记录" >&2
     return 1
   fi
   check_cf_response "$response" || return 1
   actual_ip="$(jq -r '.result.content // empty' <<<"$response")"
   if [[ "$actual_ip" != "$expected_ip" ]]; then
-    log "Cloudflare A 记录核验失败：期望 $expected_ip，实际 ${actual_ip:-空}" >&2
+    log "Cloudflare DNS 记录核验失败：期望 $expected_ip，实际 ${actual_ip:-空}" >&2
     return 1
   fi
   return 0
@@ -379,14 +429,15 @@ send_telegram_notification() {
 }
 
 sync_dns() {
-  local new_ip="$1" zone_id response count changed record_id old_ip body
+  local record_name="$1" record_type="$2" new_ip="$3"
+  local zone_id response count changed record_id old_ip body
 
-  zone_id="$(find_zone_id)" || return 1
+  zone_id="$(find_zone_id "$record_name")" || return 1
   if ! response="$(cf_curl -G "$API_BASE/zones/$zone_id/dns_records" \
-    --data-urlencode 'type=A' \
-    --data-urlencode "name=$CF_DNS_RECORD" \
+    --data-urlencode "type=$record_type" \
+    --data-urlencode "name=$record_name" \
     --data-urlencode 'per_page=100')"; then
-    log "无法查询 DNS 记录 $CF_DNS_RECORD" >&2
+    log "无法查询 DNS 记录 $record_name" >&2
     return 1
   fi
   check_cf_response "$response" || return 1
@@ -394,24 +445,25 @@ sync_dns() {
   count="$(jq '.result | length' <<<"$response")"
   if (( count == 0 )); then
     if [[ "$CF_CREATE_RECORD" != "true" ]]; then
-      log "A 记录不存在，且 CF_CREATE_RECORD=false" >&2
+      log "$record_type 记录不存在，且 CF_CREATE_RECORD=false" >&2
       return 1
     fi
     body="$(jq -cn \
-      --arg name "$CF_DNS_RECORD" \
+      --arg name "$record_name" \
       --arg content "$new_ip" \
       --argjson proxied "$CF_PROXIED" \
       --argjson ttl "$CF_TTL" \
-      '{type:"A", name:$name, content:$content, proxied:$proxied, ttl:$ttl}')"
+      --arg type "$record_type" \
+      '{type:$type, name:$name, content:$content, proxied:$proxied, ttl:$ttl}')"
     if ! response="$(cf_curl -X POST "$API_BASE/zones/$zone_id/dns_records" --data "$body")"; then
-      log "创建 A 记录失败" >&2
+      log "创建 $record_type 记录失败" >&2
       return 1
     fi
     check_cf_response "$response" || return 1
     record_id="$(jq -r '.result.id // empty' <<<"$response")"
-    [[ -n "$record_id" ]] || { log "新建 A 记录后未返回记录 ID" >&2; return 1; }
-    verify_a_record "$zone_id" "$record_id" "$new_ip" || return 1
-    log "已创建并核验 A 记录：$CF_DNS_RECORD -> $new_ip"
+    [[ -n "$record_id" ]] || { log "新建 $record_type 记录后未返回记录 ID" >&2; return 1; }
+    verify_dns_record "$zone_id" "$record_id" "$new_ip" || return 1
+    log "已创建并核验 $record_type 记录：$record_name -> $new_ip"
     return 0
   fi
 
@@ -421,12 +473,12 @@ sync_dns() {
     body="$(jq -cn --arg content "$new_ip" '{content:$content}')"
     if ! response="$(cf_curl -X PATCH \
       "$API_BASE/zones/$zone_id/dns_records/$record_id" --data "$body")"; then
-      log "更新 A 记录失败：$CF_DNS_RECORD" >&2
+      log "更新 $record_type 记录失败：$record_name" >&2
       return 1
     fi
     check_cf_response "$response" || return 1
-    verify_a_record "$zone_id" "$record_id" "$new_ip" || return 1
-    log "已更新并核验 A 记录：$CF_DNS_RECORD，$old_ip -> $new_ip"
+    verify_dns_record "$zone_id" "$record_id" "$new_ip" || return 1
+    log "已更新并核验 $record_type 记录：$record_name，$old_ip -> $new_ip"
     changed=1
   done < <(jq -r '.result[] | [.id, .content] | @tsv' <<<"$response")
 
@@ -437,32 +489,56 @@ sync_dns() {
       log "DNS 已更新，但无法记录 Telegram 每日更换次数，因此未发送提醒" >&2
     fi
   else
-    log "DNS 已是最新：$CF_DNS_RECORD -> $new_ip"
+    log "DNS 已是最新：$record_name -> $new_ip"
   fi
 }
 
 stopped=false
 trap 'stopped=true' INT TERM
-last_synced_ip=""
+last_synced_ipv4=""
+last_synced_ipv6=""
 
 prepare_daily_log
-log "DDNS 已启动：域名 $CF_DNS_RECORD，检查间隔 ${CHECK_INTERVAL} 秒"
+log "IPv4 DDNS 已启动：域名 $CF_DNS_RECORD，检查间隔 ${CHECK_INTERVAL} 秒"
+if [[ -n "$CF_DNS_RECORD_V6" ]]; then
+  log "IPv6 DDNS 已启用：域名 $CF_DNS_RECORD_V6"
+else
+  log "IPv6 DDNS 未启用"
+fi
 while [[ "$stopped" == "false" ]]; do
   clear_log_after_midnight
-  if current_ip="$(get_public_ipv4)"; then
-    if [[ "$current_ip" != "$last_synced_ip" ]]; then
-      log "检测到公网 IPv4：$current_ip"
+  if current_ipv4="$(get_public_ipv4)"; then
+    if [[ "$current_ipv4" != "$last_synced_ipv4" ]]; then
+      log "检测到公网 IPv4：$current_ipv4"
     else
-      log "公网 IPv4 未变化：$current_ip"
+      log "公网 IPv4 未变化：$current_ipv4"
     fi
     # 即使服务器 IP 未变，也核验 Cloudflare 中该域名的 A 记录是否被手动修改或同步失败。
-    if sync_dns "$current_ip"; then
-      last_synced_ip="$current_ip"
+    if sync_dns "$CF_DNS_RECORD" "A" "$current_ipv4"; then
+      last_synced_ipv4="$current_ipv4"
     else
-      log "本轮 DNS 核验或同步失败，${CHECK_INTERVAL} 秒后重试" >&2
+      log "本轮 IPv4 DNS 核验或同步失败，${CHECK_INTERVAL} 秒后重试" >&2
     fi
   else
-    log "本轮未能确认公网 IPv4，${CHECK_INTERVAL} 秒后重试" >&2
+    log "本轮未能确认公网 IPv4" >&2
+  fi
+
+  if [[ -n "$CF_DNS_RECORD_V6" ]]; then
+    if current_ipv6="$(get_public_ipv6)"; then
+      if [[ "$current_ipv6" != "$last_synced_ipv6" ]]; then
+        log "检测到公网 IPv6：$current_ipv6"
+      else
+        log "公网 IPv6 未变化：$current_ipv6"
+      fi
+      # 即使服务器 IPv6 未变，也核验 Cloudflare 中该域名的 AAAA 记录是否一致。
+      if sync_dns "$CF_DNS_RECORD_V6" "AAAA" "$current_ipv6"; then
+        last_synced_ipv6="$current_ipv6"
+      else
+        log "本轮 IPv6 DNS 核验或同步失败，${CHECK_INTERVAL} 秒后重试" >&2
+      fi
+    else
+      log "本轮未能确认公网 IPv6" >&2
+    fi
   fi
 
   sleep "$CHECK_INTERVAL" &
