@@ -3,7 +3,7 @@
 # 依赖：bash；curl 和 jq 缺失时会自动安装
 #
 # 直接运行后会交互询问 Cloudflare Token 和需要更新的完整域名。
-# Token 仅保存在当前进程内，不会写入脚本或其他文件，可安全上传公开仓库。
+# 首次配置会将 Token 写入仅 root 可读的 systemd 环境文件，以便服务器重启后自动运行；不会写入脚本。
 
 set -uo pipefail
 
@@ -16,6 +16,9 @@ CF_PROXIED="${CF_PROXIED:-false}"
 CF_TTL="${CF_TTL:-1}"
 DEFAULT_TELEGRAM_SERVER_NAME="AWS--新加坡--1"
 RUN_MODE="${1:-start}"
+SYSTEMD_SERVICE_NAME="cloudflare-ddns.service"
+SYSTEMD_ENV_FILE="${DDNS_CONFIG_FILE:-/etc/cloudflare-ddns.env}"
+SYSTEMD_UNIT_FILE="/etc/systemd/system/$SYSTEMD_SERVICE_NAME"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
@@ -84,8 +87,30 @@ running_pid() {
   printf '%s' "$pid"
 }
 
+systemd_available() {
+  command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
+systemd_unit_installed() {
+  systemd_available && [[ -f "$SYSTEMD_UNIT_FILE" ]]
+}
+
+systemctl_as_root() {
+  if (( EUID == 0 )); then
+    systemctl "$@"
+    return
+  fi
+  command -v sudo >/dev/null 2>&1 || return 1
+  sudo systemctl "$@"
+}
+
 case "$RUN_MODE" in
   --status)
+    if systemd_unit_installed && systemctl is-active --quiet "$SYSTEMD_SERVICE_NAME"; then
+      pid="$(systemctl show --property=MainPID --value "$SYSTEMD_SERVICE_NAME" 2>/dev/null || true)"
+      log "DDNS 正由 systemd 运行，PID：${pid:-未知}，日志：$LOG_FILE"
+      exit 0
+    fi
     if pid="$(running_pid)"; then
       log "DDNS 正在后台运行，PID：$pid，日志：$LOG_FILE"
       exit 0
@@ -94,6 +119,11 @@ case "$RUN_MODE" in
     exit 1
     ;;
   --stop)
+    if systemd_unit_installed; then
+      systemctl_as_root stop "$SYSTEMD_SERVICE_NAME" || die "无法停止 systemd 服务：$SYSTEMD_SERVICE_NAME"
+      log "已停止 systemd 服务：$SYSTEMD_SERVICE_NAME"
+      exit 0
+    fi
     if pid="$(running_pid)"; then
       kill -TERM "$pid" || die "无法停止 PID $pid"
       log "已发送停止信号，PID：$pid"
@@ -226,36 +256,94 @@ CF_DNS_RECORD_V6="${CF_DNS_RECORD_V6%.}"
 [[ "$CF_CREATE_RECORD" == "true" || "$CF_CREATE_RECORD" == "false" ]] || die "CF_CREATE_RECORD 必须是 true 或 false"
 [[ "$CF_PROXIED" == "true" || "$CF_PROXIED" == "false" ]] || die "CF_PROXIED 必须是 true 或 false"
 
+systemd_value() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/ }"
+  printf '"%s"' "$value"
+}
+
+write_systemd_variable() {
+  local name="$1" value="$2"
+  printf '%s=' "$name"
+  systemd_value "$value"
+  printf '\n'
+}
+
+install_systemd_service() {
+  local run_as_root=() config_temp unit_temp
+
+  systemd_available || return 1
+  if (( EUID != 0 )); then
+    command -v sudo >/dev/null 2>&1 || die "当前不是 root 用户且系统没有 sudo，无法配置开机自启"
+    run_as_root=(sudo)
+  fi
+
+  umask 077
+  config_temp="$(mktemp)" || die "无法创建 systemd 配置临时文件"
+  unit_temp="$(mktemp)" || { rm -f -- "$config_temp"; die "无法创建 systemd 服务临时文件"; }
+
+  {
+    write_systemd_variable DDNS_CF_API_TOKEN "$CF_API_TOKEN"
+    write_systemd_variable DDNS_CF_DNS_RECORD "$CF_DNS_RECORD"
+    write_systemd_variable DDNS_CF_DNS_RECORD_V6 "$CF_DNS_RECORD_V6"
+    write_systemd_variable DDNS_TELEGRAM_SERVER_NAME "$TELEGRAM_SERVER_NAME"
+    write_systemd_variable DDNS_TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
+    write_systemd_variable DDNS_TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID"
+    write_systemd_variable CHECK_INTERVAL "$CHECK_INTERVAL"
+    write_systemd_variable HTTP_TIMEOUT "$HTTP_TIMEOUT"
+    write_systemd_variable CF_ZONE_ID "$CF_ZONE_ID"
+    write_systemd_variable CF_CREATE_RECORD "$CF_CREATE_RECORD"
+    write_systemd_variable CF_PROXIED "$CF_PROXIED"
+    write_systemd_variable CF_TTL "$CF_TTL"
+    write_systemd_variable DDNS_LOG_FILE "$LOG_FILE"
+    write_systemd_variable DDNS_COUNT_STATE_FILE "$COUNT_STATE_FILE"
+  } >"$config_temp"
+
+  {
+    printf '%s\n' '[Unit]'
+    printf '%s\n' 'Description=Cloudflare DDNS updater'
+    printf '%s\n' 'Wants=network-online.target'
+    printf '%s\n' 'After=network-online.target'
+    printf '\n%s\n' '[Service]'
+    printf '%s\n' 'Type=simple'
+    printf 'EnvironmentFile=%s\n' "$SYSTEMD_ENV_FILE"
+    printf 'ExecStart='
+    systemd_value "$SCRIPT_PATH"
+    printf '%s\n' ' --daemon-child'
+    printf '%s\n' 'Restart=always'
+    printf '%s\n' 'RestartSec=10'
+    printf 'StandardOutput=append:%s\n' "$LOG_FILE"
+    printf 'StandardError=append:%s\n' "$LOG_FILE"
+    printf '\n%s\n' '[Install]'
+    printf '%s\n' 'WantedBy=multi-user.target'
+  } >"$unit_temp"
+
+  if ! "${run_as_root[@]}" install -m 600 "$config_temp" "$SYSTEMD_ENV_FILE" ||
+    ! "${run_as_root[@]}" install -m 644 "$unit_temp" "$SYSTEMD_UNIT_FILE"; then
+    rm -f -- "$config_temp" "$unit_temp"
+    die "无法安装 systemd 配置文件"
+  fi
+  rm -f -- "$config_temp" "$unit_temp"
+
+  "${run_as_root[@]}" systemctl daemon-reload || die "systemd 配置重载失败"
+  "${run_as_root[@]}" systemctl enable "$SYSTEMD_SERVICE_NAME" || die "无法启用开机自启"
+  "${run_as_root[@]}" systemctl restart "$SYSTEMD_SERVICE_NAME" || die "无法启动 systemd 服务"
+}
+
 if [[ "$RUN_MODE" != "--daemon-child" ]]; then
   if pid="$(running_pid)"; then
     die "DDNS 已经在运行，PID：$pid"
   fi
-  rm -f -- "$PID_FILE"
-  umask 077
-  : >>"$LOG_FILE" || die "无法写入日志文件：$LOG_FILE"
-
-  DDNS_CF_API_TOKEN="$CF_API_TOKEN" \
-  DDNS_CF_DNS_RECORD="$CF_DNS_RECORD" \
-  DDNS_CF_DNS_RECORD_V6="$CF_DNS_RECORD_V6" \
-  DDNS_TELEGRAM_SERVER_NAME="$TELEGRAM_SERVER_NAME" \
-  DDNS_TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
-  DDNS_TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID" \
-  DDNS_LOG_FILE="$LOG_FILE" \
-  DDNS_PID_FILE="$PID_FILE" \
-  DDNS_COUNT_STATE_FILE="$COUNT_STATE_FILE" \
-    nohup "$SCRIPT_PATH" --daemon-child >>"$LOG_FILE" 2>&1 </dev/null &
-  child_pid=$!
-  printf '%s\n' "$child_pid" >"$PID_FILE" || die "无法写入 PID 文件：$PID_FILE"
-  sleep 1
-  if ! kill -0 "$child_pid" 2>/dev/null; then
-    rm -f -- "$PID_FILE"
-    die "后台启动失败，请查看日志：$LOG_FILE"
+  if install_systemd_service; then
+    log "DDNS 已启动并设置为开机自启"
+    log "查看状态：sudo systemctl status $SYSTEMD_SERVICE_NAME"
+    log "停止服务：sudo systemctl stop $SYSTEMD_SERVICE_NAME"
+    log "日志文件：$LOG_FILE"
+    exit 0
   fi
-  log "DDNS 已转入后台运行，PID：$child_pid"
-  log "日志文件：$LOG_FILE"
-  log "查看状态：sudo $SCRIPT_PATH --status"
-  log "停止服务：sudo $SCRIPT_PATH --stop"
-  exit 0
+  die "当前系统未运行 systemd，无法设置开机自启"
 fi
 
 valid_public_ipv4() {
