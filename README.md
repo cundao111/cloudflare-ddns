@@ -33,6 +33,18 @@ sudo /opt/cloudflare-ddns/cloudflare-ddns.sh --status
 sudo /opt/cloudflare-ddns/cloudflare-ddns.sh --stop
 ```
 
+### 重启服务
+
+```bash
+sudo systemctl restart cloudflare-ddns
+```
+
+### 确认是否重启成功
+
+```bash
+sudo systemctl status cloudflare-ddns
+```
+
 ### 查看实时日志
 
 ```bash
